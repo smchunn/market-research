@@ -1,0 +1,10 @@
+polars>=0.20.31
+requests>=2.31.0
+census>=0.8.21
+googlemaps>=4.10.0
+geopandas>=0.14.4
+folium>=0.16.0
+beautifulsoup4>=4.12.3
+us>=3.2.0
+xlsxwriter
+fastexcel
