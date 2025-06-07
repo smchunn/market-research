@@ -16,5 +16,8 @@ install: requirements.txt | $(VENV)
 test:
 	$(VENV)/bin/python main.py
 
+dash:
+	$(VENV)/bin/python -m streamlit run $(SRC)/streamlit_app.py
+
 clean:
 	rm -rf $(VENV)
