@@ -12,3 +12,5 @@ streamlit
 watchdog
 aiosqlite
 google-generativeai
+streamlit-folium==0.15.1
+python-dotenv>=1.0.0

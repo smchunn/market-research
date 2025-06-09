@@ -10,6 +10,28 @@ from us.states import State
 import os
 from math import radians, sin, cos, sqrt, atan2
 import google.generativeai as genai
+import logging
+from datetime import datetime
+import sys
+import re
+
+# Configure logging based on debug flag
+def setup_logging(debug=False):
+    """Configure logging with appropriate level and handlers."""
+    level = logging.DEBUG if debug else logging.INFO
+    handlers = [logging.FileHandler('api_requests.log')]
+    
+    # Add console handler only in debug mode
+    if debug:
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        handlers.append(console_handler)
+    
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=handlers
+    )
 
 # Configuration
 REGION_STATE = "DC"
@@ -148,6 +170,19 @@ def get_zip_codes(state, start_zip, radius_miles):
         return []
 
 
+def log_api_request(api_type: str, endpoint: str, params: dict = None, status: str = None, error: str = None):
+    """Log API request details."""
+    log_data = {
+        'timestamp': datetime.now().isoformat(),
+        'api_type': api_type,
+        'endpoint': endpoint,
+        'params': {k: v for k, v in (params or {}).items() if k != 'key'},  # Exclude API keys
+        'status': status,
+        'error': error
+    }
+    logging.info(f"API Request: {log_data}")
+
+
 def get_census_data(zip_codes, census_api_key=None):
     """Fetch population, children, and income data from Census API, supplement with free_zipcode_data."""
     census = Census(census_api_key)
@@ -167,6 +202,7 @@ def get_census_data(zip_codes, census_api_key=None):
     for zip_code in zip_codes:
         print(zip_code)
         try:
+            log_api_request('census', 'acs5.zipcode', {'zip_code': zip_code})
             result = census.acs5.zipcode(
                 fields=(
                     "B01001_001E",  # Total population
@@ -186,6 +222,7 @@ def get_census_data(zip_codes, census_api_key=None):
                 zcta=zip_code,
                 year=2023,
             )
+            log_api_request('census', 'acs5.zipcode', {'zip_code': zip_code}, 'success')
             if result:
                 pop = result[0]["B01001_001E"]
                 if pop <= 0:
@@ -292,39 +329,40 @@ def find_potential_sites(priority_zips, google_api_key):
             else:
                 params["type"] = place_type
             try:
-                while True:
-                    response = requests.get(base_url, params=params, headers=headers)
-                    response.raise_for_status()
-                    data = response.json()
-                    if data["status"] != "OK":
-                        print(
-                            f"API error for {place_type} in {zip_code}: {data.get('error_message', data['status'])}"
-                        )
-                        print(f"Full API response: {data}")
-                        break
-                    for place in data.get("results", []):
-                        if "rating" not in place or place["rating"] < MIN_PROCEED_SCORE:
-                            continue
-                        site = {
-                            "zip_code": zip_code,
-                            "name": place.get("name", ""),
-                            "address": place.get("vicinity", ""),
-                            "place_id": place.get("place_id", ""),
-                            "rating": place.get("rating", 0.0),
-                            "latitude": place.get("geometry", {})
-                            .get("location", {})
-                            .get("lat", 0.0),
-                            "longitude": place.get("geometry", {})
-                            .get("location", {})
-                            .get("lng", 0.0),
-                            "place_type": place_type,
-                        }
-                        sites.append(site)
-                    next_page_token = data.get("next_page_token")
-                    if not next_page_token:
-                        break
-                    time.sleep(2)
-                    params = {"pagetoken": next_page_token, "key": google_api_key}
+                log_api_request('google', 'place/nearbysearch', params)
+                response = requests.get(base_url, params=params, headers=headers)
+                response.raise_for_status()
+                data = response.json()
+                log_api_request('google', 'place/nearbysearch', params, data.get('status'))
+                if data["status"] != "OK":
+                    print(
+                        f"API error for {place_type} in {zip_code}: {data.get('error_message', data['status'])}"
+                    )
+                    print(f"Full API response: {data}")
+                    break
+                for place in data.get("results", []):
+                    if "rating" not in place or place["rating"] < MIN_PROCEED_SCORE:
+                        continue
+                    site = {
+                        "zip_code": zip_code,
+                        "name": place.get("name", ""),
+                        "address": place.get("vicinity", ""),
+                        "place_id": place.get("place_id", ""),
+                        "rating": place.get("rating", 0.0),
+                        "latitude": place.get("geometry", {})
+                        .get("location", {})
+                        .get("lat", 0.0),
+                        "longitude": place.get("geometry", {})
+                        .get("location", {})
+                        .get("lng", 0.0),
+                        "place_type": place_type,
+                    }
+                    sites.append(site)
+                next_page_token = data.get("next_page_token")
+                if not next_page_token:
+                    break
+                time.sleep(2)
+                params = {"pagetoken": next_page_token, "key": google_api_key}
             except Exception as e:
                 print(f"Error searching for {place_type} in {zip_code}: {e}")
                 print(f"Request URL: {response.url}")
@@ -350,27 +388,267 @@ def find_potential_sites(priority_zips, google_api_key):
 
 def get_site_amenities_with_gemini(site_name, address, amenities_list, gemini_api_key):
     genai.configure(api_key=gemini_api_key)
-    model = genai.GenerativeModel("gemini-pro")
+    genai.list_models()
+    model = genai.GenerativeModel("gemini-1.5-pro-002")
 
-    prompt = f"""Does this place have the following amenities: {', '.join(amenities_list)}?
-Respond with one line per amenity in this format:
+    prompt = f"""Analyze this place and provide information about its amenities, capacity, reputation, and current programs.
+For each amenity, respond with EXACTLY "Yes" or "No" (case sensitive).
+For capacity, provide a SINGLE NUMBER estimate of how many people the facility can accommodate.
+Respond with one line per item in this format:
 Amenity: Yes or No
+Capacity: [single number estimate of people capacity]
+Reputation: [1-3 keywords describing local reputation, comma separated]
+Current Programs: [Yes/No/Unknown] - [brief description if Yes]
 
 Place:
 Name: {site_name}
 Address: {address}
+
+Amenities to check: {', '.join(amenities_list)}
 """
     try:
+        print(f"\n=== Processing Gemini request for {site_name} ===")
+        print(f"Address: {address}")
+        print(f"Amenities to check: {amenities_list}")
+        
+        log_api_request('gemini', 'generate_content', {'site_name': site_name})
         response = model.generate_content(prompt)
+        log_api_request('gemini', 'generate_content', {'site_name': site_name}, 'success')
+        
+        print("\n=== Raw Gemini Response ===")
+        print(response.text)
+        
         result_lines = response.text.strip().split("\n")
         parsed = {}
+        
+        # Initialize all amenities as False
+        for amenity in amenities_list:
+            parsed[amenity.lower()] = False
+        
+        print("\n=== Parsing Response ===")
         for line in result_lines:
             if ":" in line:
                 k, v = line.split(":", 1)
-                amenity = k.strip().lower()
-                has_it = v.strip().lower() in ["yes", "true"]
-                parsed[amenity] = has_it
+                key = k.strip().lower()
+                value = v.strip()
+                print(f"Processing line - Key: '{key}', Value: '{value}'")
+                
+                # Handle amenities - only set to True if explicitly "Yes"
+                if key in [a.lower() for a in amenities_list]:
+                    # Convert value to lowercase and strip whitespace for comparison
+                    value = value.lower().strip()
+                    # Only set to True if the value is exactly "yes"
+                    parsed[key] = value == "yes"
+                    print(f"  Amenity '{key}': {parsed[key]} (value was '{value}')")
+                # Handle capacity - extract single number
+                elif key == "capacity":
+                    try:
+                        # Extract first number found in the string
+                        numbers = re.findall(r'\d+', value)
+                        if numbers:
+                            capacity = int(numbers[0])
+                            parsed["estimated_capacity"] = capacity
+                            print(f"  Capacity: {capacity}")
+                        else:
+                            parsed["estimated_capacity"] = 0
+                            print(f"  No capacity number found in: {value}")
+                    except:
+                        parsed["estimated_capacity"] = 0
+                        print(f"  Error parsing capacity from: {value}")
+                # Handle reputation
+                elif key == "reputation":
+                    keywords = [k.strip() for k in value.split(",")]
+                    keywords = keywords[:3]  # Take only first 3 keywords
+                    parsed["local_reputation"] = ", ".join(keywords)
+                    print(f"  Reputation: {parsed['local_reputation']}")
+                # Handle current programs
+                elif key == "current programs":
+                    parts = value.split("-", 1)
+                    status = parts[0].strip().lower()
+                    description = parts[1].strip() if len(parts) > 1 else ""
+                    
+                    if status == "yes":
+                        parsed["program_currently_hosted"] = "Yes"
+                        parsed["program_description"] = description
+                    elif status == "no":
+                        parsed["program_currently_hosted"] = "No"
+                    else:
+                        parsed["program_currently_hosted"] = "Unknown"
+                    print(f"  Program Status: {parsed['program_currently_hosted']}")
+                    if description:
+                        print(f"  Program Description: {description}")
+        
+        print("\n=== Final Parsed Results ===")
+        for key, value in parsed.items():
+            print(f"{key}: {value}")
+        
         return parsed
     except Exception as e:
-        print(f"Error with Gemini for {site_name}: {e}")
-        return {}
+        print(f"\n=== Error Processing {site_name} ===")
+        print(f"Error: {str(e)}")
+        # Return default values on error
+        default_parsed = {a.lower(): False for a in amenities_list}
+        default_parsed.update({
+            "estimated_capacity": 0,
+            "local_reputation": "",
+            "program_currently_hosted": "Unknown"
+        })
+        print("Returning default values due to error")
+        return default_parsed
+
+
+def validate_api_key(api_type: str, api_key: str) -> bool:
+    """Validate API keys before use.
+    
+    Args:
+        api_type: Type of API ('census', 'google', or 'gemini')
+        api_key: The API key to validate
+        
+    Returns:
+        bool: True if valid, False otherwise
+    """
+    if not api_key:
+        return False
+        
+    try:
+        if api_type == 'census':
+            # Test Census API with a simple query
+            census = Census(api_key)
+            census.acs5.zipcode(
+                fields=("B01001_001E",),
+                state_fips="*",
+                county_fips="*",
+                tract="*",
+                zcta="20001",
+                year=2023
+            )
+            return True
+            
+        elif api_type == 'google':
+            # Test Google Maps API with a simple Places query
+            base_url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
+            params = {
+                "location": "38.8977,-77.0365",  # DC coordinates
+                "radius": 1000,
+                "key": api_key
+            }
+            response = requests.get(base_url, params=params)
+            return response.status_code == 200
+            
+        elif api_type == 'gemini':
+            # Test Gemini API by initializing the model
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel("gemini-1.5-pro-002")
+            return True
+            
+        return False
+    except Exception as e:
+        print(f"Error validating {api_type} API key: {e}")
+        return False
+
+
+def find_competitor_camps(
+    zip_codes,
+    google_api_key,
+    radius=5000,
+    min_rating=0.0,
+    competitor_types=None,
+    max_results_per_zip=10
+):
+    """
+    Search for competitor day camps in the given zip codes using Google Maps Places API.
+    Returns a Polars DataFrame of competitor camps.
+    """
+    if competitor_types is None or len(competitor_types) == 0:
+        competitor_types = ["day camp", "summer camp", "child care", "campground"]
+    all_competitors = []
+    zip_df = pl.read_csv(ZIPCODE_DATA_URL)
+    zip_df = zip_df.with_columns(
+        pl.col("code").cast(str).str.zfill(5).alias("code")
+    ).filter(pl.col("code").is_in(zip_codes))
+    for zip_code in zip_codes:
+        zip_info = zip_df.filter(pl.col("code") == zip_code)
+        if zip_info.is_empty():
+            continue
+        lat, lng = zip_info["lat"][0], zip_info["lon"][0]
+        zip_sites = []
+        for keyword in competitor_types:
+            params = {
+                "location": f"{lat},{lng}",
+                "radius": radius,
+                "keyword": keyword,
+                "key": google_api_key
+            }
+            try:
+                log_api_request('google', 'place/nearbysearch', params)
+                response = requests.get(
+                    "https://maps.googleapis.com/maps/api/place/nearbysearch/json",
+                    params=params
+                )
+                data = response.json()
+                log_api_request('google', 'place/nearbysearch', params, data.get('status'))
+                if data.get("status") == "OK":
+                    for place in data.get("results", []):
+                        rating = place.get("rating", 0.0)
+                        if rating == "":
+                            rating = 0.0
+                        try:
+                            rating = float(rating)
+                        except Exception:
+                            rating = 0.0
+                        if rating >= min_rating:
+                            zip_sites.append({
+                                "name": place.get("name", ""),
+                                "address": place.get("vicinity", ""),
+                                "zip_code": zip_code,
+                                "latitude": place.get("geometry", {}).get("location", {}).get("lat", 0.0),
+                                "longitude": place.get("geometry", {}).get("location", {}).get("lng", 0.0),
+                                "place_type": keyword,
+                                "rating": rating,
+                                "website": place.get("website", ""),
+                                "reputation": "",
+                                "estimated_size": "",
+                                "price_point": ""
+                            })
+                # Handle pagination if needed
+                while "next_page_token" in data:
+                    time.sleep(2)
+                    params = {
+                        "pagetoken": data["next_page_token"],
+                        "key": google_api_key
+                    }
+                    response = requests.get(
+                        "https://maps.googleapis.com/maps/api/place/nearbysearch/json",
+                        params=params
+                    )
+                    data = response.json()
+                    if data.get("status") == "OK":
+                        for place in data.get("results", []):
+                            rating = place.get("rating", 0.0)
+                            if rating == "":
+                                rating = 0.0
+                            try:
+                                rating = float(rating)
+                            except Exception:
+                                rating = 0.0
+                            if rating >= min_rating:
+                                zip_sites.append({
+                                    "name": place.get("name", ""),
+                                    "address": place.get("vicinity", ""),
+                                    "zip_code": zip_code,
+                                    "latitude": place.get("geometry", {}).get("location", {}).get("lat", 0.0),
+                                    "longitude": place.get("geometry", {}).get("location", {}).get("lng", 0.0),
+                                    "place_type": keyword,
+                                    "rating": rating,
+                                    "website": place.get("website", ""),
+                                    "reputation": "",
+                                    "estimated_size": "",
+                                    "price_point": ""
+                                })
+            except Exception as e:
+                print(f"Error searching for competitors in {zip_code} with keyword '{keyword}': {e}")
+                continue
+        # Sort and limit results per zip code
+        zip_sites = sorted(zip_sites, key=lambda x: x["rating"], reverse=True)[:max_results_per_zip]
+        all_competitors.extend(zip_sites)
+    return pl.DataFrame(all_competitors)
